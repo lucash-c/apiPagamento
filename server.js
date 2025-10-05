@@ -128,6 +128,29 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
+// 🔹 Simula a aprovação de pagamento PIX (modo teste)
+app.post("/simular/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${id}`, {
+      method: "PUT",
+      headers: {
+        "Authorization": `Bearer ${process.env.MP_TEST_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ status: "approved" })
+    });
+
+    const data = await mpRes.json();
+    res.json({ success: data.status === "approved", data });
+  } catch (err) {
+    console.error("Erro ao simular pagamento:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
 // 🔹 Endpoint para o frontend checar status de um pagamento
 app.get("/status/:id", (req, res) => {
   const { id } = req.params;
