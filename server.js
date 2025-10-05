@@ -77,7 +77,11 @@ app.post("/pagar/:lojaId", async (req, res) => {
       };
     }
 
-    res.json(data);
+    // 🔹 Retorna o data original + paymentId explicitamente
+    res.json({
+      paymentId: data.id,
+      ...data,
+    });
   } catch (error) {
     console.error("Erro no pagamento:", error);
     res.status(500).json({ error: error.message });
@@ -93,7 +97,7 @@ app.post("/webhook", async (req, res) => {
     if (evento?.data?.id) {
       const pagamentoId = evento.data.id;
 
-      // opcional: consultar API do Mercado Pago pra pegar status atual
+      // consultar API do Mercado Pago pra pegar status atual
       const tokens = await getTokensFromSheet();
       let statusFinal = "unknown";
 
@@ -136,10 +140,10 @@ app.post("/simular/:id", async (req, res) => {
     const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${id}`, {
       method: "PUT",
       headers: {
-        "Authorization": `Bearer ${process.env.MP_TEST_TOKEN}`,
-        "Content-Type": "application/json"
+        Authorization: `Bearer ${process.env.MP_TEST_TOKEN}`,
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify({ status: "approved" })
+      body: JSON.stringify({ status: "approved" }),
     });
 
     const data = await mpRes.json();
@@ -150,15 +154,14 @@ app.post("/simular/:id", async (req, res) => {
   }
 });
 
-
 // 🔹 Endpoint para o frontend checar status de um pagamento
 app.get("/status/:id", (req, res) => {
   const { id } = req.params;
   const info = pagamentos[id];
   if (info) {
-    return res.json({ status: info.status });
+    return res.json({ paymentId: id, status: info.status });
   } else {
-    return res.json({ status: "pending" });
+    return res.json({ paymentId: id, status: "pending" });
   }
 });
 
