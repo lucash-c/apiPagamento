@@ -58,6 +58,52 @@ Retorna status persistido do pagamento.
 
 Retentativa manual segura do callback de aprovação (somente para pagamentos `approved`).
 
+### `POST /api/payments/:paymentId/refund` (interno/operacional)
+
+Solicita refund seguro para pagamento PIX já aprovado, com validações fortes de multiloja, correlação e idempotência local.
+
+Payload:
+
+```json
+{
+  "loja_id": "uuid-da-loja",
+  "correlation_id": "corr-123",
+  "reason": "pedido_recusado_pela_loja",
+  "metadata": {
+    "operator": "system",
+    "source": "manual"
+  }
+}
+```
+
+Regras de segurança:
+
+- pagamento deve existir localmente;
+- `payment_id` deve pertencer à `loja_id` informada (sem cross-tenant);
+- se `correlation_id` for enviado, deve coincidir com o persistido;
+- pagamento precisa estar `approved` para ser elegível;
+- se já estiver reembolsado, a resposta é idempotente (sem duplicar operação);
+- se existir refund em andamento para o mesmo pagamento, retorna resposta segura/idempotente.
+
+Estados locais de refund:
+
+- `pending`
+- `in_process`
+- `refunded`
+- `failed`
+- `rejected`
+
+Campos auditáveis persistidos por tentativa:
+
+- id interno do refund
+- `payment_id`, `loja_id`, `correlation_id`
+- `reason`, `metadata`
+- `idempotency_key`
+- status local
+- `provider_refund_id`, `provider_status`, `provider_payload`
+- `refunded_amount`
+- timestamps (`created_at`, `updated_at`, `requested_at`, `finished_at`)
+
 ## Callback enviado ao backend principal
 
 Payload:

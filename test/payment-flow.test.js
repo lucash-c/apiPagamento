@@ -475,3 +475,187 @@ test("rota nova de status valida isolamento por loja e correlation_id sem quebra
 
   await new Promise((resolve) => server.close(resolve));
 });
+
+test("refund seguro: sucesso, idempotência forte e isolamento multiloja", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pay-test-"));
+  const dataFile = path.join(tempDir, "store.json");
+  const sheetCsv = "lojaId,mercado_pago_access_token\nloja-a,token-a\nloja-b,token-b\n";
+  const refundCalls = [];
+
+  const httpClient = async (url, options = {}) => {
+    if (url === "https://sheet.local") return makeResponse(200, sheetCsv, true);
+    if (url === "https://api.mercadopago.com/v1/payments/mp-rf-1/refunds") {
+      refundCalls.push({ url, options });
+      return makeResponse(201, { id: "rf-001", status: "approved", amount: 59.9 });
+    }
+    throw new Error(`URL inesperada: ${url}`);
+  };
+
+  const env = {
+    SHEET_PROPRIETARIOS: "https://sheet.local",
+    API_BASE_URL: "https://api.local",
+    CALLBACK_SHARED_SECRET: "secret",
+  };
+
+  const store = await createStore(dataFile);
+  await store.upsertPayment({
+    payment_id: "mp-rf-1",
+    loja_id: "loja-a",
+    correlation_id: "corr-rf-1",
+    status: "approved",
+    amount: 59.9,
+    metodo: "pix",
+  });
+
+  const app = createApp({ db: store, httpClient, env, logger: { error() {}, warn() {} } });
+  const { server, baseUrl } = await startServer(app);
+
+  const first = await fetch(`${baseUrl}/api/payments/mp-rf-1/refund`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      loja_id: "loja-a",
+      correlation_id: "corr-rf-1",
+      reason: "pedido_recusado_pela_loja",
+      metadata: { operator: "sys" },
+    }),
+  });
+  assert.equal(first.status, 200);
+  const firstPayload = await first.json();
+  assert.equal(firstPayload.ok, true);
+  assert.equal(firstPayload.refund.status, "refunded");
+
+  const second = await fetch(`${baseUrl}/api/payments/mp-rf-1/refund`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      loja_id: "loja-a",
+      correlation_id: "corr-rf-1",
+      reason: "pedido_recusado_pela_loja",
+      metadata: { operator: "sys" },
+    }),
+  });
+  assert.equal(second.status, 200);
+  const secondPayload = await second.json();
+  assert.equal(secondPayload.idempotent, true);
+  assert.equal(refundCalls.length, 1);
+
+  const otherLoja = await fetch(`${baseUrl}/api/payments/mp-rf-1/refund`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ loja_id: "loja-b", reason: "pedido_recusado_pela_loja" }),
+  });
+  assert.equal(otherLoja.status, 404);
+
+  await new Promise((resolve) => server.close(resolve));
+});
+
+test("refund seguro: validações de not found, correlation_id, não aprovado e já concluído", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pay-test-"));
+  const dataFile = path.join(tempDir, "store.json");
+  const sheetCsv = "lojaId,mercado_pago_access_token\nloja-a,token-a\n";
+  let refundCalls = 0;
+
+  const httpClient = async (url, options = {}) => {
+    if (url === "https://sheet.local") return makeResponse(200, sheetCsv, true);
+    if (url === "https://api.mercadopago.com/v1/payments/mp-approved/refunds") {
+      refundCalls += 1;
+      return makeResponse(201, { id: "rf-009", status: "in_process", amount: 10 });
+    }
+    throw new Error(`URL inesperada: ${url}`);
+  };
+
+  const env = {
+    SHEET_PROPRIETARIOS: "https://sheet.local",
+    API_BASE_URL: "https://api.local",
+    CALLBACK_SHARED_SECRET: "secret",
+  };
+
+  const store = await createStore(dataFile);
+  await store.upsertPayment({
+    payment_id: "mp-pending",
+    loja_id: "loja-a",
+    correlation_id: "corr-a",
+    status: "pending",
+    amount: 30,
+    metodo: "pix",
+  });
+  await store.upsertPayment({
+    payment_id: "mp-approved",
+    loja_id: "loja-a",
+    correlation_id: "corr-approved",
+    status: "approved",
+    amount: 10,
+    metodo: "pix",
+  });
+  await store.upsertPayment({
+    payment_id: "mp-refunded",
+    loja_id: "loja-a",
+    correlation_id: "corr-r",
+    status: "refunded",
+    amount: 8,
+    metodo: "pix",
+  });
+
+  const app = createApp({ db: store, httpClient, env, logger: { error() {}, warn() {} } });
+  const { server, baseUrl } = await startServer(app);
+
+  const notFound = await fetch(`${baseUrl}/api/payments/mp-inexistente/refund`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ loja_id: "loja-a", reason: "pedido_recusado" }),
+  });
+  assert.equal(notFound.status, 404);
+
+  const wrongCorrelation = await fetch(`${baseUrl}/api/payments/mp-pending/refund`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      loja_id: "loja-a",
+      correlation_id: "correlation-errada",
+      reason: "pedido_recusado",
+    }),
+  });
+  assert.equal(wrongCorrelation.status, 409);
+
+  const notApproved = await fetch(`${baseUrl}/api/payments/mp-pending/refund`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ loja_id: "loja-a", reason: "pedido_recusado" }),
+  });
+  assert.equal(notApproved.status, 409);
+
+  const inProcess = await fetch(`${baseUrl}/api/payments/mp-approved/refund`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      loja_id: "loja-a",
+      correlation_id: "corr-approved",
+      reason: "pedido_recusado",
+    }),
+  });
+  assert.equal(inProcess.status, 202);
+
+  const inProcessDuplicate = await fetch(`${baseUrl}/api/payments/mp-approved/refund`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      loja_id: "loja-a",
+      correlation_id: "corr-approved",
+      reason: "pedido_recusado",
+    }),
+  });
+  assert.equal(inProcessDuplicate.status, 202);
+  assert.equal(refundCalls, 1);
+
+  const alreadyRefunded = await fetch(`${baseUrl}/api/payments/mp-refunded/refund`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ loja_id: "loja-a", reason: "pedido_recusado" }),
+  });
+  assert.equal(alreadyRefunded.status, 200);
+  const alreadyPayload = await alreadyRefunded.json();
+  assert.equal(alreadyPayload.idempotent, true);
+
+  await new Promise((resolve) => server.close(resolve));
+});
