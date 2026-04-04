@@ -272,3 +272,134 @@ test("isolamento multiloja impede uso de token da loja errada", async () => {
 
   await new Promise((resolve) => server.close(resolve));
 });
+
+test("rota nova de intent PIX prioriza token do payload e retorna contrato esperado", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pay-test-"));
+  const dataFile = path.join(tempDir, "store.json");
+  const sheetCsv = "lojaId,mercado_pago_access_token\nloja-a,token-da-planilha\n";
+
+  const seenAuth = [];
+  const httpClient = async (url, options = {}) => {
+    if (url === "https://sheet.local") return makeResponse(200, sheetCsv, true);
+    if (url === "https://api.mercadopago.com/v1/payments" && options.method === "POST") {
+      seenAuth.push(options.headers.Authorization);
+      const body = JSON.parse(options.body);
+      return makeResponse(201, {
+        id: "mp-300",
+        status: "pending",
+        transaction_amount: body.transaction_amount,
+        payment_method_id: body.payment_method_id,
+        external_reference: body.external_reference,
+        metadata: body.metadata,
+        point_of_interaction: {
+          transaction_data: {
+            qr_code_base64: "base64-qr",
+            qr_code: "000201...",
+            transaction_id: "tx-300",
+          },
+        },
+      });
+    }
+    throw new Error(`URL inesperada: ${url}`);
+  };
+
+  const env = {
+    SHEET_PROPRIETARIOS: "https://sheet.local",
+    API_BASE_URL: "https://api.local",
+    CALLBACK_SHARED_SECRET: "secret",
+  };
+
+  const store = await createStore(dataFile);
+  const app = createApp({ db: store, httpClient, env, logger: { error() {}, warn() {} } });
+  const { server, baseUrl } = await startServer(app);
+
+  const response = await fetch(`${baseUrl}/api/payments/pix/intents`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      loja_id: "loja-a",
+      public_key: "pub-key",
+      correlation_id: "corr-300",
+      amount: 50,
+      payment_method: "pix",
+      order_payload: { cart_id: "C1" },
+      mercado_pago_access_token: "token-do-payload",
+    }),
+  });
+
+  assert.equal(response.status, 201);
+  const payload = await response.json();
+  assert.equal(payload.payment_id, "mp-300");
+  assert.equal(payload.correlation_id, "corr-300");
+  assert.equal(payload.pix.qr_code_base64, "base64-qr");
+  assert.equal(payload.pix.qr_code_text, "000201...");
+  assert.equal(payload.pix.txid, "tx-300");
+  assert.deepEqual(seenAuth, ["Bearer token-do-payload"]);
+
+  await new Promise((resolve) => server.close(resolve));
+});
+
+test("rota nova de status valida isolamento por loja e correlation_id sem quebrar legado", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pay-test-"));
+  const dataFile = path.join(tempDir, "store.json");
+  const sheetCsv = "lojaId,mercado_pago_access_token\nloja-a,token-a\n";
+
+  const httpClient = async (url, options = {}) => {
+    if (url === "https://sheet.local") return makeResponse(200, sheetCsv, true);
+    if (url === "https://api.mercadopago.com/v1/payments" && options.method === "POST") {
+      const body = JSON.parse(options.body);
+      return makeResponse(201, {
+        id: "mp-400",
+        status: "pending",
+        transaction_amount: body.transaction_amount,
+        payment_method_id: body.payment_method_id,
+        external_reference: body.external_reference,
+        metadata: body.metadata,
+      });
+    }
+    throw new Error(`URL inesperada: ${url}`);
+  };
+
+  const env = {
+    SHEET_PROPRIETARIOS: "https://sheet.local",
+    API_BASE_URL: "https://api.local",
+    CALLBACK_SHARED_SECRET: "secret",
+  };
+
+  const store = await createStore(dataFile);
+  const app = createApp({ db: store, httpClient, env, logger: { error() {}, warn() {} } });
+  const { server, baseUrl } = await startServer(app);
+
+  await fetch(`${baseUrl}/pagar/loja-a`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ valor: 25, descricao: "Pedido legado", correlation_id: "corr-400" }),
+  });
+
+  const okStatusRes = await fetch(
+    `${baseUrl}/api/payments/mp-400?loja_id=loja-a&correlation_id=corr-400`
+  );
+  assert.equal(okStatusRes.status, 200);
+  const okPayload = await okStatusRes.json();
+  assert.equal(okPayload.payment_id, "mp-400");
+  assert.equal(okPayload.status, "pending");
+  assert.equal(okPayload.loja_id, "loja-a");
+  assert.equal(okPayload.correlation_id, "corr-400");
+
+  const wrongLojaRes = await fetch(
+    `${baseUrl}/api/payments/mp-400?loja_id=loja-b&correlation_id=corr-400`
+  );
+  assert.equal(wrongLojaRes.status, 404);
+
+  const wrongCorrelationRes = await fetch(
+    `${baseUrl}/api/payments/mp-400?loja_id=loja-a&correlation_id=outro`
+  );
+  assert.equal(wrongCorrelationRes.status, 404);
+
+  const legacyStatusRes = await fetch(`${baseUrl}/status/mp-400`);
+  assert.equal(legacyStatusRes.status, 200);
+  const legacyPayload = await legacyStatusRes.json();
+  assert.equal(legacyPayload.paymentId, "mp-400");
+
+  await new Promise((resolve) => server.close(resolve));
+});

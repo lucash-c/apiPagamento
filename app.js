@@ -47,6 +47,11 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
     return tokens[normalizeLojaId(lojaId)] || null;
   }
 
+  async function resolveAccessToken({ lojaId, explicitAccessToken = null }) {
+    if (explicitAccessToken) return String(explicitAccessToken).trim();
+    return getTokenByLoja(lojaId);
+  }
+
   async function fetchMercadoPagoPayment(paymentId, accessToken) {
     const resp = await httpClient(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
@@ -166,6 +171,86 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
     return sendApprovedCallback(payment, eventRecord);
   }
 
+  async function createPixPayment({
+    lojaId,
+    amount,
+    description,
+    paymentMethod = "pix",
+    payer,
+    correlationId,
+    callbackUrl = null,
+    orderPayload = null,
+    explicitAccessToken = null,
+  }) {
+    const accessToken = await resolveAccessToken({
+      lojaId,
+      explicitAccessToken,
+    });
+
+    if (!accessToken) {
+      return {
+        ok: false,
+        status: 400,
+        body: { error: "Loja não encontrada ou sem token do Mercado Pago" },
+      };
+    }
+
+    const safeCorrelationId = correlationId || crypto.randomUUID();
+    const externalReference = `${lojaId}:${safeCorrelationId}`;
+
+    const payload = {
+      transaction_amount: Number(amount),
+      description: description || `Pedido da ${lojaId}`,
+      payment_method_id: paymentMethod,
+      payer: payer || { email: "cliente@teste.com" },
+      notification_url: `${env.API_BASE_URL}/webhook`,
+      external_reference: externalReference,
+      metadata: {
+        loja_id: lojaId,
+        correlation_id: safeCorrelationId,
+        callback_url: callbackUrl,
+        order_payload: orderPayload,
+      },
+    };
+
+    const mpRes = await httpClient("https://api.mercadopago.com/v1/payments", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await mpRes.json();
+    if (!mpRes.ok || !data?.id) {
+      return {
+        ok: false,
+        status: mpRes.status || 500,
+        body: {
+          error: "Erro ao criar pagamento no Mercado Pago",
+          details: data,
+        },
+      };
+    }
+
+    const stored = await registerOrUpdatePaymentFromProvider({
+      lojaId,
+      payment: data,
+      fallback: {
+        amount: Number(amount),
+        description: description || `Pedido da ${lojaId}`,
+        metodo: paymentMethod,
+        correlation_id: safeCorrelationId,
+        external_reference: externalReference,
+        callback_url: callbackUrl,
+        payer_email: payer?.email || "cliente@teste.com",
+      },
+    });
+
+    return { ok: true, status: 200, body: data, stored };
+  }
+
   // Criar pagamento PIX
   app.post("/pagar/:lojaId", async (req, res) => {
     try {
@@ -179,67 +264,74 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
         callback_url,
       } = req.body;
 
-      const accessToken = await getTokenByLoja(lojaId);
-      if (!accessToken) {
-        return res
-          .status(400)
-          .json({ error: "Loja não encontrada ou sem token do Mercado Pago" });
-      }
-
-      const safeCorrelationId =
-        correlation_id || crypto.randomUUID();
-      const externalReference = `${lojaId}:${safeCorrelationId}`;
-
-      const payload = {
-        transaction_amount: Number(valor),
-        description: descricao || `Pedido da ${lojaId}`,
-        payment_method_id: metodo,
-        payer: payer || { email: "cliente@teste.com" },
-        notification_url: `${env.API_BASE_URL}/webhook`,
-        external_reference: externalReference,
-        metadata: {
-          loja_id: lojaId,
-          correlation_id: safeCorrelationId,
-          callback_url: callback_url || null,
-        },
-      };
-
-      const mpRes = await httpClient("https://api.mercadopago.com/v1/payments", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
-
-      const data = await mpRes.json();
-
-      if (!mpRes.ok || !data?.id) {
-        return res.status(mpRes.status || 500).json({
-          error: "Erro ao criar pagamento no Mercado Pago",
-          details: data,
-        });
-      }
-
-      await registerOrUpdatePaymentFromProvider({
+      const created = await createPixPayment({
         lojaId,
-        payment: data,
-        fallback: {
-          amount: Number(valor),
-          description: descricao || `Pedido da ${lojaId}`,
-          metodo,
-          correlation_id: safeCorrelationId,
-          external_reference: externalReference,
-          callback_url: callback_url || null,
-          payer_email: payer?.email || "cliente@teste.com",
-        },
+        amount: valor,
+        description: descricao,
+        paymentMethod: metodo,
+        payer,
+        correlationId: correlation_id,
+        callbackUrl: callback_url || null,
       });
 
-      res.json({ paymentId: data.id, ...data });
+      if (!created.ok) return res.status(created.status).json(created.body);
+      return res.json({ paymentId: created.body.id, ...created.body });
     } catch (error) {
       logger.error("Erro no pagamento:", error);
       res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/payments/pix/intents", async (req, res) => {
+    try {
+      const {
+        loja_id,
+        public_key,
+        correlation_id,
+        amount,
+        payment_method = "pix",
+        order_payload,
+        mercado_pago_access_token,
+      } = req.body || {};
+
+      const lojaId = normalizeLojaId(loja_id);
+      if (!lojaId) return res.status(400).json({ error: "loja_id é obrigatório" });
+      if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
+        return res.status(400).json({ error: "amount inválido" });
+      }
+
+      const created = await createPixPayment({
+        lojaId,
+        amount,
+        description: order_payload?.description || `Pedido da ${lojaId}`,
+        paymentMethod: payment_method,
+        payer: order_payload?.payer || { email: "cliente@teste.com" },
+        correlationId: correlation_id,
+        callbackUrl: order_payload?.callback_url || null,
+        orderPayload: {
+          ...order_payload,
+          public_key,
+        },
+        explicitAccessToken: mercado_pago_access_token,
+      });
+
+      if (!created.ok) return res.status(created.status).json(created.body);
+
+      const paymentData = created.body;
+      const txData = paymentData.point_of_interaction?.transaction_data || {};
+      return res.status(201).json({
+        payment_id: String(paymentData.id),
+        id: String(paymentData.id),
+        correlation_id: created.stored?.correlation_id || correlation_id || null,
+        pix: {
+          qr_code_base64: txData.qr_code_base64 || null,
+          qr_code_text: txData.qr_code || null,
+          txid: txData.transaction_id || null,
+        },
+      });
+    } catch (error) {
+      logger.error("Erro ao criar intent PIX:", error.message);
+      return res.status(500).json({ error: error.message });
     }
   });
 
@@ -321,6 +413,34 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
         status: payment.callback_status,
         attempts: payment.callback_attempts,
       },
+    });
+  });
+
+  app.get("/api/payments/:paymentId", async (req, res) => {
+    const paymentId = String(req.params.paymentId);
+    const lojaId = normalizeLojaId(req.query.loja_id || "");
+    const correlationId = String(req.query.correlation_id || "").trim();
+
+    const payment = await db.getPaymentByPaymentId(paymentId);
+    if (!payment) {
+      return res.status(404).json({ error: "Pagamento não encontrado" });
+    }
+
+    if (lojaId && payment.loja_id !== lojaId) {
+      return res.status(404).json({ error: "Pagamento não encontrado para loja informada" });
+    }
+
+    if (correlationId && payment.correlation_id !== correlationId) {
+      return res.status(404).json({ error: "Pagamento não encontrado para correlation_id informado" });
+    }
+
+    return res.json({
+      payment_id: payment.payment_id,
+      id: payment.payment_id,
+      status: payment.status,
+      loja_id: payment.loja_id,
+      store_id: payment.loja_id,
+      correlation_id: payment.correlation_id,
     });
   });
 
