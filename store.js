@@ -12,7 +12,7 @@ async function ensureFile(filePath) {
   } catch {
     await fs.writeFile(
       filePath,
-      JSON.stringify({ payments: {}, callbackEvents: {} }, null, 2),
+      JSON.stringify({ payments: {}, callbackEvents: {}, refunds: {} }, null, 2),
       "utf8"
     );
   }
@@ -25,7 +25,11 @@ export async function createStore(filePath) {
 
   async function readState() {
     const raw = await fs.readFile(filePath, "utf8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (!parsed.payments) parsed.payments = {};
+    if (!parsed.callbackEvents) parsed.callbackEvents = {};
+    if (!parsed.refunds) parsed.refunds = {};
+    return parsed;
   }
 
   async function writeState(state) {
@@ -145,6 +149,65 @@ export async function createStore(filePath) {
         event.status = "not_required";
         event.updated_at = nowIso();
       });
+    },
+
+    async createRefundAttempt(refundInput) {
+      return inTx(async (state) => {
+        const id = refundInput.id || `refund_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        const record = {
+          id,
+          payment_id: String(refundInput.payment_id),
+          loja_id: String(refundInput.loja_id),
+          correlation_id: refundInput.correlation_id || null,
+          status: refundInput.status || "pending",
+          refunded_amount: refundInput.refunded_amount ?? null,
+          reason: refundInput.reason || null,
+          metadata: refundInput.metadata || null,
+          provider_refund_id: refundInput.provider_refund_id || null,
+          provider_status: refundInput.provider_status || null,
+          provider_payload: refundInput.provider_payload || null,
+          idempotency_key: refundInput.idempotency_key,
+          requested_at: refundInput.requested_at || nowIso(),
+          provider_requested_at: refundInput.provider_requested_at || null,
+          finished_at: refundInput.finished_at || null,
+          created_at: nowIso(),
+          updated_at: nowIso(),
+        };
+
+        state.refunds[id] = record;
+        return record;
+      });
+    },
+
+    async updateRefund(refundId, updates) {
+      return inTx(async (state) => {
+        const current = state.refunds[refundId];
+        if (!current) return null;
+        const merged = {
+          ...current,
+          ...updates,
+          updated_at: nowIso(),
+        };
+        state.refunds[refundId] = merged;
+        return merged;
+      });
+    },
+
+    async getRefundByIdempotencyKey(idempotencyKey) {
+      return inTx(async (state) => {
+        const found = Object.values(state.refunds).find(
+          (refund) => refund.idempotency_key === idempotencyKey
+        );
+        return found || null;
+      });
+    },
+
+    async listRefundsByPaymentId(paymentId) {
+      return inTx(async (state) =>
+        Object.values(state.refunds)
+          .filter((refund) => refund.payment_id === String(paymentId))
+          .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
+      );
     },
   };
 }

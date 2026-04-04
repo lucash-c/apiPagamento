@@ -2,6 +2,7 @@ import express from "express";
 import crypto from "crypto";
 import Papa from "papaparse";
 import cors from "cors";
+import { createRefundService } from "./refund-service.js";
 
 const PIX_EXPIRATION_MINUTES = 15;
 
@@ -58,6 +59,13 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
     if (explicitAccessToken) return String(explicitAccessToken).trim();
     return getTokenByLoja(lojaId);
   }
+
+  const refundService = createRefundService({
+    db,
+    httpClient,
+    getAccessTokenByLoja: getTokenByLoja,
+    logger,
+  });
 
   async function fetchMercadoPagoPayment(paymentId, accessToken) {
     const resp = await httpClient(
@@ -470,6 +478,29 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
       store_id: payment.loja_id,
       correlation_id: payment.correlation_id,
     });
+  });
+
+  app.post("/api/payments/:paymentId/refund", async (req, res) => {
+    try {
+      const paymentId = String(req.params.paymentId || "").trim();
+      const lojaId = normalizeLojaId(req.body?.loja_id || "");
+      const reason = String(req.body?.reason || "").trim();
+      const correlationId = String(req.body?.correlation_id || "").trim();
+      const metadata = req.body?.metadata || null;
+
+      const result = await refundService.requestRefund({
+        paymentId,
+        lojaId,
+        reason,
+        correlationId: correlationId || null,
+        metadata,
+      });
+
+      return res.status(result.status).json(result.body);
+    } catch (error) {
+      logger.error("Erro ao solicitar refund:", error.message);
+      return res.status(500).json({ error: "Erro interno ao solicitar refund" });
+    }
   });
 
   return app;
