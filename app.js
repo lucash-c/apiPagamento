@@ -3,8 +3,15 @@ import crypto from "crypto";
 import Papa from "papaparse";
 import cors from "cors";
 
+const PIX_EXPIRATION_MINUTES = 15;
+
 function normalizeLojaId(lojaId = "") {
   return String(lojaId).trim();
+}
+
+function buildPixExpirationTimestamp(baseDate = new Date()) {
+  const expiresAt = new Date(baseDate.getTime() + PIX_EXPIRATION_MINUTES * 60 * 1000);
+  return expiresAt.toISOString();
 }
 
 function buildHmacSignature(secret, timestamp, payloadString) {
@@ -89,6 +96,7 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
       callback_url:
         fallback.callback_url || payment.metadata?.callback_url || null,
       payer_email: payment.payer?.email || fallback.payer_email || null,
+      expires_at: payment.date_of_expiration || fallback.expires_at || null,
       provider_payload: JSON.stringify(payment),
     };
 
@@ -212,6 +220,7 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
 
     const safeCorrelationId = correlationId || crypto.randomUUID();
     const externalReference = `${lojaId}:${safeCorrelationId}`;
+    const pixExpiresAt = buildPixExpirationTimestamp();
 
     const payload = {
       transaction_amount: Number(amount),
@@ -220,6 +229,7 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
       payer: payer || { email: "cliente@teste.com" },
       notification_url: `${env.API_BASE_URL}/webhook`,
       external_reference: externalReference,
+      date_of_expiration: pixExpiresAt,
       metadata: {
         loja_id: lojaId,
         correlation_id: safeCorrelationId,
@@ -260,6 +270,7 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
         external_reference: externalReference,
         callback_url: callbackUrl,
         payer_email: payer?.email || "cliente@teste.com",
+        expires_at: data.date_of_expiration || pixExpiresAt,
       },
     });
 
@@ -343,6 +354,7 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
           qr_code_base64: txData.qr_code_base64 || null,
           qr_code_text: txData.qr_code || null,
           txid: txData.transaction_id || null,
+          expires_at: created.stored?.expires_at || paymentData.date_of_expiration || null,
         },
       });
     } catch (error) {
