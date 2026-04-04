@@ -181,11 +181,26 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
     callbackUrl = null,
     orderPayload = null,
     explicitAccessToken = null,
+    requireExplicitAccessToken = false,
   }) {
-    const accessToken = await resolveAccessToken({
-      lojaId,
-      explicitAccessToken,
-    });
+    const providedAccessToken = String(explicitAccessToken || "").trim();
+    if (requireExplicitAccessToken && !providedAccessToken) {
+      return {
+        ok: false,
+        status: 400,
+        body: {
+          error:
+            "mercado_pago_access_token é obrigatório e deve ser enviado no payload desta rota",
+        },
+      };
+    }
+
+    const accessToken = requireExplicitAccessToken
+      ? providedAccessToken
+      : await resolveAccessToken({
+          lojaId,
+          explicitAccessToken: providedAccessToken || null,
+        });
 
     if (!accessToken) {
       return {
@@ -313,6 +328,7 @@ export function createApp({ db, httpClient, env = process.env, logger = console 
           public_key,
         },
         explicitAccessToken: mercado_pago_access_token,
+        requireExplicitAccessToken: true,
       });
 
       if (!created.ok) return res.status(created.status).json(created.body);

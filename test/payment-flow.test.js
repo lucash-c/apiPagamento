@@ -273,13 +273,15 @@ test("isolamento multiloja impede uso de token da loja errada", async () => {
   await new Promise((resolve) => server.close(resolve));
 });
 
-test("rota nova de intent PIX prioriza token do payload e retorna contrato esperado", async () => {
+test("rota nova de intent PIX usa apenas token do payload e retorna contrato esperado", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pay-test-"));
   const dataFile = path.join(tempDir, "store.json");
   const sheetCsv = "lojaId,mercado_pago_access_token\nloja-a,token-da-planilha\n";
 
   const seenAuth = [];
+  const requests = [];
   const httpClient = async (url, options = {}) => {
+    requests.push({ url, options });
     if (url === "https://sheet.local") return makeResponse(200, sheetCsv, true);
     if (url === "https://api.mercadopago.com/v1/payments" && options.method === "POST") {
       seenAuth.push(options.headers.Authorization);
@@ -335,6 +337,62 @@ test("rota nova de intent PIX prioriza token do payload e retorna contrato esper
   assert.equal(payload.pix.qr_code_text, "000201...");
   assert.equal(payload.pix.txid, "tx-300");
   assert.deepEqual(seenAuth, ["Bearer token-do-payload"]);
+  assert.equal(
+    requests.some((request) => request.url === "https://sheet.local"),
+    false
+  );
+
+  await new Promise((resolve) => server.close(resolve));
+});
+
+test("rota nova de intent PIX retorna 400 quando mercado_pago_access_token está ausente", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pay-test-"));
+  const dataFile = path.join(tempDir, "store.json");
+  const sheetCsv = "lojaId,mercado_pago_access_token\nloja-a,token-da-planilha\n";
+
+  const requests = [];
+  const httpClient = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (url === "https://sheet.local") return makeResponse(200, sheetCsv, true);
+    if (url === "https://api.mercadopago.com/v1/payments") {
+      return makeResponse(201, { id: "nao-deveria-criar" });
+    }
+    throw new Error(`URL inesperada: ${url}`);
+  };
+
+  const env = {
+    SHEET_PROPRIETARIOS: "https://sheet.local",
+    API_BASE_URL: "https://api.local",
+    CALLBACK_SHARED_SECRET: "secret",
+  };
+
+  const store = await createStore(dataFile);
+  const app = createApp({ db: store, httpClient, env, logger: { error() {}, warn() {} } });
+  const { server, baseUrl } = await startServer(app);
+
+  const response = await fetch(`${baseUrl}/api/payments/pix/intents`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      loja_id: "loja-a",
+      correlation_id: "corr-sem-token",
+      amount: 50,
+      payment_method: "pix",
+      order_payload: { cart_id: "C2" },
+    }),
+  });
+
+  assert.equal(response.status, 400);
+  const payload = await response.json();
+  assert.match(payload.error, /mercado_pago_access_token é obrigatório/i);
+  assert.equal(
+    requests.some((request) => request.url === "https://sheet.local"),
+    false
+  );
+  assert.equal(
+    requests.some((request) => request.url === "https://api.mercadopago.com/v1/payments"),
+    false
+  );
 
   await new Promise((resolve) => server.close(resolve));
 });
