@@ -21,6 +21,15 @@ function makeResponse(status, data, isText = false) {
   };
 }
 
+function assertIsoWithin15Minutes(isoValue) {
+  assert.equal(typeof isoValue, "string");
+  const expiresAt = new Date(isoValue).getTime();
+  assert.equal(Number.isNaN(expiresAt), false);
+  const diffMs = expiresAt - Date.now();
+  assert.ok(diffMs >= 14 * 60 * 1000, `diferença menor que 14 min: ${diffMs}`);
+  assert.ok(diffMs <= 16 * 60 * 1000, `diferença maior que 16 min: ${diffMs}`);
+}
+
 async function startServer(app) {
   return new Promise((resolve) => {
     const server = app.listen(0, "127.0.0.1", () => {
@@ -46,12 +55,14 @@ test("cria pagamento, persiste e mantém status após restart lógico", async ()
 
     if (url === "https://api.mercadopago.com/v1/payments" && options.method === "POST") {
       const body = JSON.parse(options.body);
+      assertIsoWithin15Minutes(body.date_of_expiration);
       return makeResponse(201, {
         id: "mp-100",
         status: "pending",
         description: body.description,
         transaction_amount: body.transaction_amount,
         payment_method_id: body.payment_method_id,
+        date_of_expiration: body.date_of_expiration,
         external_reference: body.external_reference,
         metadata: body.metadata,
         payer: body.payer,
@@ -286,11 +297,13 @@ test("rota nova de intent PIX usa apenas token do payload e retorna contrato esp
     if (url === "https://api.mercadopago.com/v1/payments" && options.method === "POST") {
       seenAuth.push(options.headers.Authorization);
       const body = JSON.parse(options.body);
+      assertIsoWithin15Minutes(body.date_of_expiration);
       return makeResponse(201, {
         id: "mp-300",
         status: "pending",
         transaction_amount: body.transaction_amount,
         payment_method_id: body.payment_method_id,
+        date_of_expiration: body.date_of_expiration,
         external_reference: body.external_reference,
         metadata: body.metadata,
         point_of_interaction: {
@@ -336,6 +349,7 @@ test("rota nova de intent PIX usa apenas token do payload e retorna contrato esp
   assert.equal(payload.pix.qr_code_base64, "base64-qr");
   assert.equal(payload.pix.qr_code_text, "000201...");
   assert.equal(payload.pix.txid, "tx-300");
+  assert.match(payload.pix.expires_at, /^\d{4}-\d{2}-\d{2}T/);
   assert.deepEqual(seenAuth, ["Bearer token-do-payload"]);
   assert.equal(
     requests.some((request) => request.url === "https://sheet.local"),
